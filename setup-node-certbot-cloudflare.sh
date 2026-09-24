@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # Universal Certbot + Cloudflare DNS-01 setup for Remnawave nodes.
 # Ubuntu / Debian oriented, Docker Compose aware.
 
-SCRIPT_VERSION="2.2.4"
+SCRIPT_VERSION="2.2.6"
 PROG=${0##*/}
 
 # ---- Defaults ----------------------------------------------------------------
@@ -50,6 +50,8 @@ CURRENT_TASK=""
 RELEVANT=()
 TARGET_LINEAGES=()
 UNUSED_LINEAGES=()
+CLEANUP_CANDIDATES=()
+CLEANUP_SELECTION=()
 SUMMARY_OK=()
 SUMMARY_WARN=()
 SUMMARY_FAIL=()
@@ -58,6 +60,9 @@ declare -A STAGING_TESTED=()
 declare -A PRODUCTION_RENEWED=()
 declare -A LINEAGE_USAGE=()
 declare -A LINEAGE_USAGE_REASON=()
+declare -A CLEANUP_KIND=()
+declare -A CLEANUP_STATUS=()
+declare -A CLEANUP_DOMAINS=()
 LAST_TASK_OUTPUT=""
 TLS_TOPOLOGY="unknown"
 TLS_443_OWNER=""
@@ -129,7 +134,7 @@ usage() {
 
 Параметры:
   --yes, -y                    Принимать безопасные значения по умолчанию
-  --cleanup-legacy             Удалить неиспользуемый legacy node-N, если это безопасно
+  --cleanup-legacy             Автоматически выбрать безопасный legacy node-N для удаления
   --skip-dry-run               Пропустить финальные staging-тесты Let's Encrypt
   --node N                     Явно указать номер ноды
   --zone DOMAIN                Явно указать DNS-зону
@@ -145,6 +150,10 @@ usage() {
   $PROG --audit
   $PROG --apply --yes
   $PROG --apply --node 6 --zone argent-projects.com
+
+После основной настройки интерактивный режим показывает найденные
+неиспользуемые сертификаты и позволяет выбрать номера для удаления.
+По умолчанию ничего не удаляется.
 EOF
 }
 
@@ -515,62 +524,89 @@ add_relevant_once() {
 }
 
 lineage_reference_probe() {
-  local name=$1 c pid base compose_render mounts nginx_t proc_text
+  local name=$1 c pid base compose_render mounts nginx_t proc_text line
   local -a reasons=()
 
-  # Only active configuration counts as a reference. Historical logs, backups,
-  # shell history and Certbot's own files must never keep an obsolete lineage alive.
+  # IMPORTANT: we are detecting use of the CERTIFICATE MATERIAL, not merely a
+  # mention of the hostname. A server_name such as n-11.example can
+  # intentionally use the certificate from n-11g.example and must not keep the
+  # separate n-11 Certbot lineage alive forever.
   base=${COMPOSE_DIR:-$DEFAULT_COMPOSE_DIR}
+
   for c in \
     "$base/docker-compose.yml" \
     "$base/compose.yml" \
     "$base/compose.yaml" \
     "$base/nginx.conf"; do
     [[ -f $c ]] || continue
-    if grep -Fq "$name" "$c" 2>/dev/null; then
-      reasons+=("$c")
-    fi
+    while IFS= read -r line; do
+      [[ $line == *"$name"* ]] || continue
+      if [[ $line == *"/etc/letsencrypt/live/$name/"* \
+         || $line == *"/etc/nginx/ssl/$name/"* \
+         || $line == *"/ssl/$name"* \
+         || $line == *"$name/fullchain.pem"* \
+         || $line == *"$name/privkey.pem"* ]]; then
+        reasons+=("$c")
+      elif [[ $line =~ ssl_certificate(_key)?|ssl_trusted_certificate|fullchain\.pem|privkey\.pem ]]; then
+        reasons+=("$c")
+      fi
+    done <"$c"
   done
 
-  # Capture producer output first. This avoids false negatives from grep -q +
-  # pipefail/SIGPIPE on large docker/nginx output.
+  # Rendered Compose is useful, but only certificate-looking lines count. A
+  # plain hostname in an environment variable or comment is not enough.
   if [[ -d $base ]] && have docker; then
     compose_render=$(cd "$base" && docker compose config 2>/dev/null || true)
-    if [[ -n $compose_render ]] && grep -Fq "$name" <<<"$compose_render"; then
-      reasons+=("docker-compose(active)")
-    fi
+    while IFS= read -r line; do
+      [[ $line == *"$name"* ]] || continue
+      if [[ $line == *"/etc/letsencrypt/live/$name/"* \
+         || $line == *"/etc/nginx/ssl/$name/"* \
+         || $line == *"/ssl/$name"* \
+         || $line == *"$name/fullchain.pem"* \
+         || $line == *"$name/privkey.pem"* ]]; then
+        reasons+=("docker-compose(active)")
+      fi
+    done <<<"$compose_render"
   fi
 
-  # Docker mounts are one of the strongest signals that a lineage is in use.
+  # Docker mounts are a strong signal: if a source or destination path contains
+  # the lineage name, actual certificate material is being mounted.
   if have docker; then
     while IFS= read -r c; do
       [[ -n $c ]] || continue
       mounts=$(docker inspect "$c" --format '{{range .Mounts}}{{printf "%s -> %s\n" .Source .Destination}}{{end}}' 2>/dev/null || true)
-      if [[ -n $mounts ]] && grep -Fq "$name" <<<"$mounts"; then
-        reasons+=("mount:$c")
-      fi
+      while IFS= read -r line; do
+        [[ $line == *"$name"* ]] || continue
+        if [[ $line == *"/etc/letsencrypt/"* || $line == *"/ssl/"* || $line == *"/etc/nginx/ssl/"* ]]; then
+          reasons+=("mount:$c")
+        fi
+      done <<<"$mounts"
     done < <(docker ps -a --format '{{.Names}}' 2>/dev/null || true)
 
     c=${NGINX_CONTAINER:-${NGINX_CONTAINER_OVERRIDE:-$DEFAULT_NGINX_CONTAINER}}
     if docker inspect "$c" >/dev/null 2>&1; then
       nginx_t=$(docker exec "$c" nginx -T 2>/dev/null || true)
-      if [[ -n $nginx_t ]] && grep -Fq "$name" <<<"$nginx_t"; then
-        reasons+=("nginx:$c")
-      fi
+      while IFS= read -r line; do
+        [[ $line == *"$name"* ]] || continue
+        if [[ $line =~ ssl_certificate(_key)?|ssl_trusted_certificate ]]; then
+          reasons+=("nginx:$c")
+        fi
+      done <<<"$nginx_t"
     fi
   fi
 
-  # Some Remnawave topologies have rw-core in front of nginx. Only record a
-  # boolean match; never print process environment because it may contain secrets.
+  # rw-core only counts when its command line/environment refers to an actual
+  # certificate path. A bare domain/SNI value is service configuration, not
+  # evidence that this Certbot lineage is consumed.
   while IFS= read -r pid; do
     [[ -r /proc/$pid/cmdline ]] || continue
     proc_text=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
-    if [[ -n $proc_text ]] && grep -Fq "$name" <<<"$proc_text"; then
+    if [[ $proc_text == *"/etc/letsencrypt/live/$name/"* || $proc_text == *"/ssl/$name/"* ]]; then
       reasons+=("rw-core:cmdline")
     fi
     if [[ -r /proc/$pid/environ ]]; then
       proc_text=$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null || true)
-      if [[ -n $proc_text ]] && grep -Fq "$name" <<<"$proc_text"; then
+      if [[ $proc_text == *"/etc/letsencrypt/live/$name/"* || $proc_text == *"/ssl/$name/"* ]]; then
         reasons+=("rw-core:env")
       fi
     fi
@@ -691,12 +727,10 @@ scan_certificates() {
   if ((${#UNUSED_LINEAGES[@]})); then
     warn "Найдены lineage без активных ссылок: ${UNUSED_LINEAGES[*]}"
     note "Они не будут мигрироваться/перевыпускаться этим запуском. В конце можно удалить их после повторной проверки ссылок."
-    summary_warn "Lineage без активных ссылок: ${UNUSED_LINEAGES[*]}"
   fi
 
   if [[ -f /etc/letsencrypt/renewal/$LEGACY_NAME.conf ]]; then
     warn "$LEGACY_NAME — legacy-сертификат; он исключён из миграции и dry-run."
-    summary_warn "Найден legacy Certbot lineage: $LEGACY_NAME"
   fi
 }
 
@@ -1306,65 +1340,228 @@ legacy_reference_report() {
   tr ',' '\n' <<<"$refs"
 }
 
-maybe_cleanup_legacy() {
-  local legacy=$LEGACY_NAME refs status
-  [[ -f /etc/letsencrypt/renewal/$legacy.conf ]] || return 0
+cleanup_add_candidate() {
+  local candidate=$1 kind=$2 status domains x
+  [[ -f /etc/letsencrypt/renewal/$candidate.conf ]] || return 0
 
-  status=$(cert_status "$legacy")
-  warn "Остался legacy Certbot lineage: $legacy ($status)"
-  refs=$(legacy_reference_report "$legacy")
+  for x in "${CLEANUP_CANDIDATES[@]:-}"; do
+    [[ $x == "$candidate" ]] && return 0
+  done
 
-  if [[ -n $refs ]]; then
-    warn "Он используется локальной конфигурацией и НЕ будет удалён:"
-    printf '%s' "$refs" | sed 's/^/    /'
-    summary_warn "Legacy $legacy сохранён: найдены ссылки"
-    return 0
-  fi
-
-  note "Ссылки на $legacy не найдены в $COMPOSE_DIR, /etc/nginx и Docker mounts."
-  note "Если оставить его, общий таймер Certbot может продолжать попытки продления."
-
-  if ((AUTO_CLEANUP_LEGACY)); then
-    :
-  elif ! confirm "Удалить неиспользуемый legacy lineage $legacy из Certbot?" N; then
-    summary_warn "Неиспользуемый legacy lineage оставлен: $legacy"
-    return 0
-  fi
-
-  if run_task "Удаляю неиспользуемый legacy lineage $legacy" certbot delete --non-interactive --cert-name "$legacy"; then
-    summary_ok "Неиспользуемый legacy lineage удалён"
-  else
-    summary_warn "Не удалось удалить legacy lineage $legacy"
-  fi
+  status=$(cert_status "$candidate")
+  domains=$(cert_domains "$candidate" | paste -sd, -)
+  CLEANUP_CANDIDATES+=("$candidate")
+  CLEANUP_KIND["$candidate"]=$kind
+  CLEANUP_STATUS["$candidate"]=$status
+  CLEANUP_DOMAINS["$candidate"]=${domains:--}
 }
 
-maybe_cleanup_unused_lineages() {
-  local name refs status
-  ((${#UNUSED_LINEAGES[@]})) || return 0
+collect_cleanup_candidates() {
+  local name refs
+  CLEANUP_CANDIDATES=()
+  CLEANUP_SELECTION=()
+  CLEANUP_KIND=()
+  CLEANUP_STATUS=()
+  CLEANUP_DOMAINS=()
 
-  for name in "${UNUSED_LINEAGES[@]}"; do
+  # Legacy node-N is considered only after the same active-reference check
+  # used throughout the script. Historical logs do not count as usage.
+  if [[ -f /etc/letsencrypt/renewal/$LEGACY_NAME.conf ]]; then
+    refs=$(lineage_reference_probe "$LEGACY_NAME")
+    if [[ -z $refs ]]; then
+      cleanup_add_candidate "$LEGACY_NAME" "legacy"
+    else
+      warn "$LEGACY_NAME сохранён: найдены активные ссылки · $refs"
+      summary_warn "Legacy $LEGACY_NAME сохранён: найдены активные ссылки"
+    fi
+  fi
+
+  # Only lineages that were explicitly classified as unreferenced during the
+  # main audit are offered here. This intentionally avoids touching unrelated
+  # certificates on the host (mail, other websites, etc.).
+  for name in "${UNUSED_LINEAGES[@]:-}"; do
     [[ -f /etc/letsencrypt/renewal/$name.conf ]] || continue
     refs=$(lineage_reference_probe "$name")
-    if [[ -n $refs ]]; then
-      warn "$name снова обнаружен в активной конфигурации; удаление отменено: $refs"
+    if [[ -z $refs ]]; then
+      cleanup_add_candidate "$name" "без активных ссылок"
+    else
+      warn "$name больше не считается неиспользуемым: найдены активные ссылки · $refs"
       summary_warn "$name сохранён: появились активные ссылки"
+    fi
+  done
+}
+
+show_cleanup_candidates() {
+  local i name
+  collect_cleanup_candidates
+
+  if ((${#CLEANUP_CANDIDATES[@]} == 0)); then
+    ok "Безопасных кандидатов на удаление не найдено"
+    return 1
+  fi
+
+  info "Найдены Certbot lineage без активных ссылок:"
+  printf '\n'
+  for i in "${!CLEANUP_CANDIDATES[@]}"; do
+    name=${CLEANUP_CANDIDATES[$i]}
+    printf '  %b%d%b) %b%s%b\n' "$CYAN$BOLD" "$((i + 1))" "$RESET" "$BOLD" "$name" "$RESET"
+    printf '      Статус: %s · тип: %s\n' "${CLEANUP_STATUS[$name]}" "${CLEANUP_KIND[$name]}"
+    printf '      Домены: %s\n' "${CLEANUP_DOMAINS[$name]}"
+  done
+  printf '\n'
+  note "В список не попадают сертификаты с активными ссылками и сертификаты других сервисов."
+  note "Перед удалением каждый выбранный lineage будет проверен повторно."
+  return 0
+}
+
+parse_cleanup_selection() {
+  local input=$1 max=$2 token first last i x
+  local -A seen=()
+  local -a tokens=()
+  CLEANUP_SELECTION=()
+
+  input=${input//[[:space:]]/}
+  [[ -n $input ]] || return 0
+
+  case "${input,,}" in
+    all|a|'*'|все)
+      for ((i=1; i<=max; i++)); do CLEANUP_SELECTION+=("$i"); done
+      return 0
+      ;;
+  esac
+
+  IFS=',' read -r -a tokens <<<"$input"
+  for token in "${tokens[@]}"; do
+    [[ -n $token ]] || return 1
+    if [[ $token =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      first=${BASH_REMATCH[1]}
+      last=${BASH_REMATCH[2]}
+      ((first >= 1 && last >= 1 && first <= max && last <= max && first <= last)) || return 1
+      for ((i=first; i<=last; i++)); do
+        [[ -n ${seen[$i]+x} ]] || { CLEANUP_SELECTION+=("$i"); seen[$i]=1; }
+      done
+    elif [[ $token =~ ^[0-9]+$ ]]; then
+      x=$token
+      ((x >= 1 && x <= max)) || return 1
+      [[ -n ${seen[$x]+x} ]] || { CLEANUP_SELECTION+=("$x"); seen[$x]=1; }
+    else
+      return 1
+    fi
+  done
+}
+
+delete_selected_cleanup_candidates() {
+  local idx name refs
+  local -a names=() safe_names=()
+
+  for idx in "${CLEANUP_SELECTION[@]:-}"; do
+    name=${CLEANUP_CANDIDATES[$((idx - 1))]}
+    [[ -n $name ]] && names+=("$name")
+  done
+  ((${#names[@]})) || return 0
+
+  printf '\n'
+  warn "Вы выбрали для удаления:"
+  for name in "${names[@]}"; do
+    printf '    - %s\n' "$name"
+  done
+
+  # A final reference check happens immediately before the destructive action.
+  for name in "${names[@]}"; do
+    [[ -f /etc/letsencrypt/renewal/$name.conf ]] || {
+      warn "$name уже отсутствует в Certbot; пропускаю."
+      continue
+    }
+    refs=$(lineage_reference_probe "$name")
+    if [[ -n $refs ]]; then
+      warn "$name НЕ будет удалён: перед удалением появились активные ссылки · $refs"
+      summary_warn "$name сохранён: активные ссылки найдены при финальной проверке"
       continue
     fi
+    safe_names+=("$name")
+  done
 
-    status=$(cert_status "$name")
-    warn "$name · активные ссылки не найдены · состояние: $status"
-    note "Стандартный certbot.timer продолжит обслуживать этот lineage, пока он существует."
-    if ! confirm "Удалить неиспользуемый Certbot lineage $name?" N; then
+  ((${#safe_names[@]})) || {
+    warn "После повторной проверки безопасных сертификатов для удаления не осталось."
+    return 0
+  }
+
+  if ((AUTO_CLEANUP_LEGACY)) && ((${#safe_names[@]} == 1)) && [[ ${safe_names[0]} == "$LEGACY_NAME" ]]; then
+    :
+  elif ! confirm "Удалить выбранные ${#safe_names[@]} Certbot lineage? Это удалит их файлы из /etc/letsencrypt." N; then
+    for name in "${safe_names[@]}"; do
       summary_warn "Неиспользуемый lineage оставлен: $name"
-      continue
-    fi
+    done
+    info "Удаление отменено."
+    return 0
+  fi
 
-    if run_task "Удаляю неиспользуемый lineage $name" certbot delete --non-interactive --cert-name "$name"; then
-      summary_ok "Неиспользуемый lineage удалён: $name"
+  for name in "${safe_names[@]}"; do
+    if run_task "Удаляю Certbot lineage $name" certbot delete --non-interactive --cert-name "$name"; then
+      summary_ok "Удалён неиспользуемый lineage: $name"
     else
       summary_warn "Не удалось удалить неиспользуемый lineage: $name"
     fi
   done
+}
+
+cleanup_unused_selector() {
+  section "12 · Очистка неиспользуемых сертификатов"
+
+  if ! show_cleanup_candidates; then
+    return 0
+  fi
+
+  # --yes alone never implies destructive certificate deletion.
+  # --cleanup-legacy is the only backwards-compatible automatic cleanup flag.
+  if ((ASSUME_YES)) && ((AUTO_CLEANUP_LEGACY == 0)); then
+    warn "Неинтерактивный режим: кандидаты показаны, но удаление пропущено."
+    note "Для автоматического legacy-cleanup используйте --cleanup-legacy."
+    for name in "${CLEANUP_CANDIDATES[@]}"; do
+      summary_warn "Неиспользуемый lineage оставлен: $name"
+    done
+    return 0
+  fi
+
+  if ((AUTO_CLEANUP_LEGACY)); then
+    local i name
+    CLEANUP_SELECTION=()
+    for i in "${!CLEANUP_CANDIDATES[@]}"; do
+      name=${CLEANUP_CANDIDATES[$i]}
+      [[ $name == "$LEGACY_NAME" ]] && CLEANUP_SELECTION+=("$((i + 1))")
+    done
+    if ((${#CLEANUP_SELECTION[@]})); then
+      delete_selected_cleanup_candidates
+    else
+      ok "Безопасный legacy lineage для автоматического удаления не найден"
+    fi
+    return 0
+  fi
+
+  local choice
+  while :; do
+    tty_read -r -p "Что удалить? Номера через запятую/диапазон (например 1,3 или 1-3), all — все, Enter — пропустить: " choice
+    if [[ -z ${choice//[[:space:]]/} ]]; then
+      info "Удаление сертификатов пропущено."
+      for name in "${CLEANUP_CANDIDATES[@]}"; do
+        summary_warn "Неиспользуемый lineage оставлен: $name"
+      done
+      return 0
+    fi
+    if parse_cleanup_selection "$choice" "${#CLEANUP_CANDIDATES[@]}"; then
+      break
+    fi
+    warn "Некорректный выбор. Используйте, например: 1,3  ·  1-3  ·  all"
+  done
+
+  delete_selected_cleanup_candidates
+}
+
+preview_cleanup_candidates() {
+  section "6 · Кандидаты на удаление"
+  if show_cleanup_candidates; then
+    note "Аудит ничего не удаляет. Для удаления запустите режим «2) Настройка и исправления»."
+  fi
 }
 
 redundant_lineage_notes() {
@@ -1407,6 +1604,51 @@ redundant_lineage_notes() {
   done
 }
 
+nginx_domain_listener_kind() {
+  local domain=$1 c nginx_t
+  c=${NGINX_CONTAINER:-${NGINX_CONTAINER_OVERRIDE:-$DEFAULT_NGINX_CONTAINER}}
+  have docker || { printf 'unknown\n'; return 0; }
+  docker inspect "$c" >/dev/null 2>&1 || { printf 'unknown\n'; return 0; }
+  nginx_t=$(docker exec "$c" nginx -T 2>/dev/null || true)
+  [[ -n $nginx_t ]] || { printf 'unknown\n'; return 0; }
+
+  awk -v dom="$domain" '
+    function reset_block() { depth=0; hasdom=0; hasunix=0; hasdirect=0 }
+    BEGIN { inserver=0; foundunix=0; founddirect=0 }
+    {
+      line=$0
+      if (!inserver && line ~ /^[[:space:]]*server[[:space:]]*\{/) {
+        inserver=1
+        reset_block()
+      }
+      if (inserver) {
+        if (line ~ /server_name/ && index(line, dom) > 0) hasdom=1
+        if (line ~ /^[[:space:]]*listen[[:space:]]+/) {
+          if (line ~ /unix:/) hasunix=1
+          else if (line ~ /(^|[^0-9])443([^0-9]|$)/) hasdirect=1
+        }
+        tmp=line; opens=gsub(/\{/, "", tmp)
+        tmp=line; closes=gsub(/\}/, "", tmp)
+        depth += opens - closes
+        if (depth <= 0) {
+          if (hasdom) {
+            if (hasunix) foundunix=1
+            if (hasdirect) founddirect=1
+          }
+          inserver=0
+          reset_block()
+        }
+      }
+    }
+    END {
+      if (founddirect && foundunix) print "mixed"
+      else if (founddirect) print "direct"
+      else if (foundunix) print "unix"
+      else print "unknown"
+    }
+  ' <<<"$nginx_t"
+}
+
 detect_tls_topology() {
   local c nginx_t line direct_listen unix_listen
   TLS_TOPOLOGY="unknown"
@@ -1414,7 +1656,6 @@ detect_tls_topology() {
   TLS_443_PID=""
   NGINX_CONTAINER_PID=""
   NGINX_LISTEN_SUMMARY=""
-SHADOW_SYNC_SPECS=()
 
   if have ss; then
     line=$(ss -lntp 2>/dev/null | awk '$4 ~ /:443$/ {print; exit}' || true)
@@ -1433,7 +1674,10 @@ SHADOW_SYNC_SPECS=()
     direct_listen=$(grep -E 'listen[[:space:]]+([^;[:space:]]*:)?443([^0-9]|;)' <<<"$nginx_t" | head -n1 | sed 's/^[[:space:]]*//' || true)
     unix_listen=$(grep -E 'listen[[:space:]]+unix:[^;]*ssl' <<<"$nginx_t" | head -n1 | sed 's/^[[:space:]]*//' || true)
 
-    if [[ -n $direct_listen ]]; then
+    if [[ -n $direct_listen ]] && grep -Eq 'ssl_preread_server_name|ssl_preread[[:space:]]+on' <<<"$nginx_t"; then
+      TLS_TOPOLOGY="nginx-stream-router"
+      NGINX_LISTEN_SUMMARY=$direct_listen
+    elif [[ -n $direct_listen ]]; then
       TLS_TOPOLOGY="nginx-direct"
       NGINX_LISTEN_SUMMARY=$direct_listen
     elif [[ -n $unix_listen ]]; then
@@ -1454,11 +1698,16 @@ SHADOW_SYNC_SPECS=()
 show_tls_topology() {
   detect_tls_topology
   case "$TLS_TOPOLOGY" in
+    nginx-stream-router)
+      ok "TLS-топология: nginx stream принимает TCP/443 и маршрутизирует соединения по SNI"
+      [[ -n $NGINX_LISTEN_SUMMARY ]] && note "stream: $NGINX_LISTEN_SUMMARY"
+      [[ -n $TLS_443_OWNER ]] && note "TCP/443: $TLS_443_OWNER${TLS_443_PID:+ · PID $TLS_443_PID}"
+      note "Доступность TLS проверяется отдельно для каждого server_name; Unix/REALITY vhost не обязан отвечать обычным TLS на :443."
+      ;;
     frontend-unix-nginx)
       ok "TLS-топология: TCP/443 обслуживает отдельный frontend, контейнер nginx принимает TLS через Unix-сокет"
       note "TCP/443: ${TLS_443_OWNER:-не определён}${TLS_443_PID:+ · PID $TLS_443_PID}"
       [[ -n $NGINX_LISTEN_SUMMARY ]] && note "nginx: $NGINX_LISTEN_SUMMARY"
-      note "Внешний openssl :443 не используется как прямая проверка сертификата контейнера nginx."
       ;;
     unix-nginx-no443)
       ok "TLS-топология: контейнер nginx принимает TLS через Unix-сокет; TCP/443 на хосте не обнаружен"
@@ -1481,27 +1730,10 @@ show_tls_topology() {
 }
 
 external_tls_check() {
-  local name d out cert tmp remote_fp local_fp subject enddate
+  local name d cert tmp remote_fp local_fp subject enddate kind severity
   local host_ok time_ok
   have openssl || return 0
   detect_tls_topology
-
-  case "$TLS_TOPOLOGY" in
-    frontend-unix-nginx|unix-nginx-no443|unix-nginx-ambiguous)
-      info "Прямая проверка :443 пропущена: сертификат контейнера nginx проверяется локально, так как его TLS listener — Unix-сокет."
-      for name in "${RELEVANT[@]}"; do
-        cert="/etc/letsencrypt/live/$name/fullchain.pem"
-        [[ -r $cert ]] || continue
-        out=$(openssl x509 -in "$cert" -noout -subject -enddate 2>/dev/null || true)
-        if [[ -n $out ]]; then
-          ok "Локальный сертификат $name читается корректно"
-          printf '%s\n' "$out" | sed 's/^/    /'
-        fi
-      done
-      return 0
-      ;;
-  esac
-
   have timeout || return 0
 
   for name in "${RELEVANT[@]}"; do
@@ -1513,14 +1745,32 @@ external_tls_check() {
 
     while IFS= read -r d; do
       [[ -n $d ]] || continue
-      tmp=$(mktemp)
+      kind=$(nginx_domain_listener_kind "$d")
 
+      # No host TCP/443 plus a Unix-only vhost is a normal internal topology.
+      if [[ -z $TLS_443_PID && $kind == unix ]]; then
+        ok "$d · сертификат проверен локально; vhost принимает TLS только через Unix-сокет"
+        continue
+      fi
+
+      tmp=$(mktemp)
       if ! timeout 8 openssl s_client -connect "$d:443" -servername "$d" -showcerts </dev/null 2>/dev/null \
           | awk '/-----BEGIN CERTIFICATE-----/{p=1} p{print} /-----END CERTIFICATE-----/{exit}' >"$tmp" \
           || [[ ! -s $tmp ]]; then
         rm -f "$tmp"
-        fail "Не удалось получить TLS-сертификат от $d:443."
-        summary_fail "$d: внешний TLS недоступен"
+        case "$kind" in
+          direct|mixed)
+            fail "Не удалось получить TLS-сертификат от $d:443 (для этого vhost настроен прямой TCP/443)."
+            summary_fail "$d: внешний TLS недоступен"
+            ;;
+          unix)
+            info "$d: обычный TLS на внешнем :443 недоступен, но vhost принимает TLS через Unix-сокет/внутренний маршрут — это не ошибка Certbot."
+            ;;
+          *)
+            warn "$d: внешний TLS на :443 недоступен; маршрут этого server_name не удалось классифицировать."
+            summary_warn "$d: внешний TLS не проверен однозначно"
+            ;;
+        esac
         continue
       fi
 
@@ -1533,20 +1783,33 @@ external_tls_check() {
       openssl x509 -in "$tmp" -noout -checkhost "$d" >/dev/null 2>&1 && host_ok=1
       openssl x509 -in "$tmp" -noout -checkend 0 >/dev/null 2>&1 && time_ok=1
 
+      severity=fail
+      [[ $kind == unix || $kind == unknown ]] && severity=warn
+
       if ((host_ok == 0)); then
-        fail "$d:443 отдаёт сертификат, который НЕ подходит для hostname $d"
+        if [[ $severity == fail ]]; then
+          fail "$d:443 отдаёт сертификат, который НЕ подходит для hostname $d"
+          summary_fail "$d: внешний сертификат не содержит нужный hostname"
+        else
+          warn "$d: внешний :443 отдаёт другой сертификат, но vhost не имеет прямого TCP/443 listener; для Unix/REALITY маршрута это может быть намеренно."
+          summary_warn "$d: внешний сертификат отличается от server_name (косвенный маршрут)"
+        fi
         [[ -n $subject ]] && note "$subject"
         [[ -n $enddate ]] && note "$enddate"
-        summary_fail "$d: внешний сертификат не содержит нужный hostname"
         rm -f "$tmp"
         continue
       fi
 
       if ((time_ok == 0)); then
-        fail "$d:443 отдаёт ПРОСРОЧЕННЫЙ сертификат"
+        if [[ $severity == fail ]]; then
+          fail "$d:443 отдаёт ПРОСРОЧЕННЫЙ сертификат"
+          summary_fail "$d: внешний сертификат просрочен"
+        else
+          warn "$d: внешний :443 отдаёт просроченный сертификат через косвенный маршрут."
+          summary_warn "$d: просроченный внешний сертификат через косвенный маршрут"
+        fi
         [[ -n $subject ]] && note "$subject"
         [[ -n $enddate ]] && note "$enddate"
-        summary_fail "$d: внешний сертификат просрочен"
         rm -f "$tmp"
         continue
       fi
@@ -1557,7 +1820,7 @@ external_tls_check() {
 
       if [[ -n $local_fp && -n $remote_fp && $local_fp != "$remote_fp" ]]; then
         warn "$d: внешний сертификат валиден, но отличается от текущего Certbot lineage $name."
-        note "Это допустимо только если nginx намеренно использует другой валидный SAN-сертификат."
+        note "Это допустимо только если SNI/stream/REALITY намеренно использует другой валидный сертификат."
         summary_warn "$d: внешний сертификат отличается от lineage $name"
       fi
 
@@ -1665,6 +1928,14 @@ final_report() {
   print_timer_state
   external_tls_check
 
+  if ((${#SUMMARY_FAIL[@]} == 0)); then
+    cleanup_unused_selector
+  else
+    section "12 · Очистка неиспользуемых сертификатов"
+    warn "Очистка пропущена: сначала устраните ошибки финальной проверки."
+    note "Ни один сертификат не был удалён."
+  fi
+
   section "Итог"
   printf '%bУСПЕХ%b  %d\n' "$GREEN$BOLD" "$RESET" "${#SUMMARY_OK[@]}"
   for name in "${SUMMARY_OK[@]:-}"; do [[ -n $name ]] && printf '  %b✔%b %s\n' "$GREEN" "$RESET" "$name"; done
@@ -1719,6 +1990,7 @@ main() {
 
   if [[ $MODE == audit ]]; then
     audit_runtime
+    preview_cleanup_candidates
     section "Аудит завершён"
     ok "Аудит выполнен. Конфигурация сертификатов и сервисов не изменялась."
     note "Для настройки выберите пункт 2 в главном меню или запустите с --apply."
@@ -1757,9 +2029,7 @@ main() {
   test_deploy_hook_once
   dry_run_relevant
 
-  section "11 · Проверка старых и неиспользуемых сертификатов"
-  maybe_cleanup_legacy
-  maybe_cleanup_unused_lineages
+  section "11 · Анализ сертификатов"
   redundant_lineage_notes
 
   final_report
