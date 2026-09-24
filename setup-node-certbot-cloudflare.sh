@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # Universal Certbot + Cloudflare DNS-01 setup for Remnawave nodes.
 # Ubuntu / Debian oriented, Docker Compose aware.
 
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.2.2"
 PROG=${0##*/}
 
 # ---- Defaults ----------------------------------------------------------------
@@ -16,6 +16,8 @@ DEFAULT_CF_CREDS=${DEFAULT_CF_CREDS:-/root/.secrets/certbot/cloudflare.ini}
 RENEW_WITHIN_DAYS=${RENEW_WITHIN_DAYS:-30}
 PROPAGATION_SECONDS=${PROPAGATION_SECONDS:-60}
 RETRY_PROPAGATION_SECONDS=${RETRY_PROPAGATION_SECONDS:-120}
+DRY_RUN_RETRY_DELAY=${DRY_RUN_RETRY_DELAY:-20}
+DRY_RUN_MAX_ATTEMPTS=${DRY_RUN_MAX_ATTEMPTS:-3}
 HOOK_PATH=${HOOK_PATH:-/etc/letsencrypt/renewal-hooks/deploy/reload-remnawave-nginx.sh}
 LOG_DIR=${LOG_DIR:-/var/log/remnawave-certbot}
 
@@ -46,10 +48,20 @@ ACTIVE_PID=""
 CURRENT_TASK=""
 
 RELEVANT=()
+TARGET_LINEAGES=()
+UNUSED_LINEAGES=()
 SUMMARY_OK=()
 SUMMARY_WARN=()
 SUMMARY_FAIL=()
 declare -A FALLBACK_ISSUED=()
+declare -A STAGING_TESTED=()
+declare -A PRODUCTION_RENEWED=()
+declare -A LINEAGE_USAGE=()
+declare -A LINEAGE_USAGE_REASON=()
+LAST_TASK_OUTPUT=""
+TLS_TOPOLOGY="unknown"
+TLS_443_OWNER=""
+NGINX_LISTEN_SUMMARY=""
 
 # ---- UI ----------------------------------------------------------------------
 if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
@@ -208,6 +220,7 @@ run_task() {
   ACTIVE_PID=""
 
   cat "$tmp" >>"$LOG_FILE"
+  LAST_TASK_OUTPUT=$(tail -n 80 "$tmp" 2>/dev/null || true)
   if ((rc == 0)); then
     ok "$label"
   else
@@ -278,10 +291,26 @@ choose_mode() {
   printf '  %b0%b) Выход\n' "$GRAY$BOLD" "$RESET"
   printf '\n'
 
-  local choice
+  local choice cleaned
   while :; do
     tty_read -r -p "Выберите действие [1]: " choice
     choice=${choice:-1}
+
+    # SSH terminals can leave ANSI escape sequences (for example from arrow
+    # keys) in the input buffer.  Keep only the meaningful menu digits so an
+    # accidental Up/Down key immediately before the answer does not turn "1"
+    # into something like $'\e[A1'.
+    cleaned=${choice//$'\e[A'/}
+    cleaned=${cleaned//$'\e[B'/}
+    cleaned=${cleaned//$'\e[C'/}
+    cleaned=${cleaned//$'\e[D'/}
+    cleaned=${cleaned//[[:space:]]/}
+    if [[ $cleaned =~ ([012])$ ]]; then
+      choice=${BASH_REMATCH[1]}
+    else
+      choice=$cleaned
+    fi
+
     case "$choice" in
       1)
         MODE="audit"
@@ -325,7 +354,9 @@ ensure_dns_tools() {
 }
 
 cloudflare_plugin_available() {
-  certbot plugins 2>/dev/null | grep -qE '^\* dns-cloudflare$'
+  local out
+  out=$(certbot plugins 2>/dev/null || true)
+  grep -qE '^\* dns-cloudflare$' <<<"$out"
 }
 
 ensure_cloudflare_plugin() {
@@ -473,6 +504,75 @@ add_relevant_once() {
   RELEVANT+=("$candidate")
 }
 
+lineage_reference_probe() {
+  local name=$1 c pid
+  local -a reasons=()
+
+  # Current Remnawave configuration files. Avoid backups and Certbot's own files.
+  for c in \
+    "$DEFAULT_COMPOSE_DIR/docker-compose.yml" \
+    "$DEFAULT_COMPOSE_DIR/compose.yml" \
+    "$DEFAULT_COMPOSE_DIR/compose.yaml" \
+    "$DEFAULT_COMPOSE_DIR/nginx.conf"; do
+    [[ -f $c ]] || continue
+    if grep -Fq "$name" "$c" 2>/dev/null; then
+      reasons+=("${c}")
+    fi
+  done
+
+  # Active Compose rendering, checked silently so secrets are never printed to terminal/log.
+  if [[ -d $DEFAULT_COMPOSE_DIR ]] && have docker; then
+    if (cd "$DEFAULT_COMPOSE_DIR" && docker compose config 2>/dev/null | grep -Fq "$name"); then
+      reasons+=("docker-compose(active)")
+    fi
+  fi
+
+  # Docker mounts are one of the strongest signals that a lineage is actually in use.
+  if have docker; then
+    while IFS= read -r c; do
+      [[ -n $c ]] || continue
+      if docker inspect "$c" --format '{{range .Mounts}}{{printf "%s -> %s\n" .Source .Destination}}{{end}}' 2>/dev/null | grep -Fq "$name"; then
+        reasons+=("mount:$c")
+      fi
+    done < <(docker ps -a --format '{{.Names}}' 2>/dev/null || true)
+
+    c=${NGINX_CONTAINER_OVERRIDE:-$DEFAULT_NGINX_CONTAINER}
+    if docker inspect "$c" >/dev/null 2>&1; then
+      if docker exec "$c" nginx -T 2>/dev/null | grep -Fq "$name"; then
+        reasons+=("nginx:$c")
+      fi
+    fi
+  fi
+
+  # Some Remnawave topologies have rw-core in front of nginx. Only record a boolean
+  # match; never print the process environment because it may contain secrets.
+  while IFS= read -r pid; do
+    [[ -r /proc/$pid/cmdline ]] || continue
+    if tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -Fq "$name"; then
+      reasons+=("rw-core:cmdline")
+    fi
+    if [[ -r /proc/$pid/environ ]] && tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -Fq "$name"; then
+      reasons+=("rw-core:env")
+    fi
+  done < <(pgrep -x rw-core 2>/dev/null || true)
+
+  if ((${#reasons[@]})); then
+    printf '%s\n' "${reasons[@]}" | sort -u | paste -sd, -
+  fi
+}
+
+add_target_once() {
+  local candidate=$1 x
+  for x in "${TARGET_LINEAGES[@]:-}"; do [[ $x == "$candidate" ]] && return; done
+  TARGET_LINEAGES+=("$candidate")
+}
+
+add_unused_once() {
+  local candidate=$1 x
+  for x in "${UNUSED_LINEAGES[@]:-}"; do [[ $x == "$candidate" ]] && return; done
+  UNUSED_LINEAGES+=("$candidate")
+}
+
 status_badge() {
   case "$1" in
     VALID) printf '%bДЕЙСТВУЕТ%b' "$GREEN" "$RESET" ;;
@@ -484,9 +584,48 @@ status_badge() {
 }
 
 scan_certificates() {
-  local f name status expiry auth domains marker
+  local f name status expiry auth domains marker refs
+  local used_count=0
   RELEVANT=()
+  TARGET_LINEAGES=()
+  UNUSED_LINEAGES=()
+  LINEAGE_USAGE=()
+  LINEAGE_USAGE_REASON=()
   LEGACY_NAME="node-${NODE_NUM}.${ZONE}"
+
+  shopt -s nullglob
+  for f in /etc/letsencrypt/renewal/*.conf; do
+    name=${f##*/}; name=${name%.conf}
+    [[ $name == "$LEGACY_NAME" ]] && continue
+    if is_relevant_lineage "$name"; then
+      add_target_once "$name"
+    fi
+  done
+  shopt -u nullglob
+
+  # Determine actual references before deciding which certificates should be touched.
+  for name in "${TARGET_LINEAGES[@]:-}"; do
+    refs=$(lineage_reference_probe "$name")
+    if [[ -n $refs ]]; then
+      LINEAGE_USAGE["$name"]="used"
+      LINEAGE_USAGE_REASON["$name"]=$refs
+      add_relevant_once "$name"
+      ((used_count+=1))
+    else
+      LINEAGE_USAGE["$name"]="unreferenced"
+      add_unused_once "$name"
+    fi
+  done
+
+  # Conservative fallback: if we cannot prove that any target lineage is used, do not
+  # silently exclude all of them. Hidden/non-Docker consumers may exist.
+  if ((used_count == 0 && ${#TARGET_LINEAGES[@]} > 0)); then
+    warn "Не удалось доказать использование ни одного целевого lineage. Включаю консервативный режим: существующие n-N/n-Ng не будут пропущены."
+    RELEVANT=("${TARGET_LINEAGES[@]}")
+    UNUSED_LINEAGES=()
+    for name in "${TARGET_LINEAGES[@]}"; do LINEAGE_USAGE["$name"]="unknown"; done
+    summary_warn "Использование целевых lineage не определено однозначно"
+  fi
 
   shopt -s nullglob
   for f in /etc/letsencrypt/renewal/*.conf; do
@@ -499,22 +638,40 @@ scan_certificates() {
 
     if [[ $name == "$LEGACY_NAME" ]]; then
       marker=' · legacy: пропущен'
-    elif is_relevant_lineage "$name"; then
-      add_relevant_once "$name"
     fi
 
     printf '  %b●%b %b%s%b\n' "$CYAN" "$RESET" "$BOLD" "$name" "$RESET"
     printf '      Статус: %b · метод: %s · до: %s%s\n' "$(status_badge "$status")" "${auth:--}" "$expiry" "$marker"
     printf '      Домены: %s\n' "${domains:--}"
+
+    if [[ $name != "$LEGACY_NAME" ]] && is_relevant_lineage "$name"; then
+      case ${LINEAGE_USAGE[$name]:-unknown} in
+        used)
+          printf '      Использование: %bИСПОЛЬЗУЕТСЯ%b · %s\n' "$GREEN" "$RESET" "${LINEAGE_USAGE_REASON[$name]}"
+          ;;
+        unreferenced)
+          printf '      Использование: %bАКТИВНЫЕ ССЫЛКИ НЕ НАЙДЕНЫ%b\n' "$YELLOW" "$RESET"
+          ;;
+        *)
+          printf '      Использование: %bНЕ ОПРЕДЕЛЕНО%b · сохранён консервативно\n' "$YELLOW" "$RESET"
+          ;;
+      esac
+    fi
   done
   shopt -u nullglob
 
   if ((${#RELEVANT[@]})); then
     printf '\n'
-    ok "Подходящие Certbot lineage: ${RELEVANT[*]}"
+    ok "Будут обслуживаться Certbot lineage: ${RELEVANT[*]}"
   else
     printf '\n'
-    warn "Не найден существующий lineage для $TARGET1 или $TARGET2."
+    warn "Не найден существующий используемый lineage для $TARGET1 или $TARGET2."
+  fi
+
+  if ((${#UNUSED_LINEAGES[@]})); then
+    warn "Найдены lineage без активных ссылок: ${UNUSED_LINEAGES[*]}"
+    note "Они не будут мигрироваться/перевыпускаться этим запуском. В конце можно удалить их после повторной проверки ссылок."
+    summary_warn "Lineage без активных ссылок: ${UNUSED_LINEAGES[*]}"
   fi
 
   if [[ -f /etc/letsencrypt/renewal/$LEGACY_NAME.conf ]]; then
@@ -745,7 +902,9 @@ EOF
 
 # ---- Certbot migration / renewal ---------------------------------------------
 certbot_has_reconfigure() {
-  certbot --help all 2>/dev/null | grep -qE '^[[:space:]]*reconfigure[[:space:]]'
+  local out
+  out=$(certbot --help all 2>/dev/null || true)
+  grep -qE '^[[:space:]]*reconfigure[[:space:]]' <<<"$out"
 }
 
 lineage_is_cloudflare_ready() {
@@ -798,12 +957,14 @@ migrate_lineage() {
 
   if certbot_has_reconfigure; then
     if run_task "$name · staging reconfigure (${PROPAGATION_SECONDS}с)" certbot_reconfigure_once "$name" "$PROPAGATION_SECONDS"; then
+      STAGING_TESTED["$name"]=1
       summary_ok "$name переведён на Cloudflare DNS-01"
       return 0
     fi
 
     warn "Первая staging-проверка не прошла. Повторяю с ожиданием ${RETRY_PROPAGATION_SECONDS}с."
     if run_task "$name · повтор staging (${RETRY_PROPAGATION_SECONDS}с)" certbot_reconfigure_once "$name" "$RETRY_PROPAGATION_SECONDS"; then
+      STAGING_TESTED["$name"]=1
       summary_ok "$name переведён на Cloudflare DNS-01 (${RETRY_PROPAGATION_SECONDS}с propagation)"
       return 0
     fi
@@ -813,6 +974,7 @@ migrate_lineage() {
   warn "Использую production fallback через certonly с сохранением всех SAN. Может быть выпущен новый сертификат."
   if run_task "$name · production fallback миграции" fallback_certonly_existing "$name" "$RETRY_PROPAGATION_SECONDS"; then
     FALLBACK_ISSUED["$name"]=1
+    PRODUCTION_RENEWED["$name"]=1
     summary_warn "$name потребовал production fallback при миграции"
     return 0
   fi
@@ -821,7 +983,8 @@ migrate_lineage() {
 }
 
 has_certbot_account() {
-  [[ -d /etc/letsencrypt/accounts ]] && find /etc/letsencrypt/accounts -type f -name regr.json -print -quit 2>/dev/null | grep -q .
+  [[ -d /etc/letsencrypt/accounts ]] || return 1
+  [[ -n $(find /etc/letsencrypt/accounts -type f -name regr.json -print -quit 2>/dev/null) ]]
 }
 
 create_combined_certificate_cmd() {
@@ -854,6 +1017,7 @@ create_combined_certificate() {
   run_task "Выпускаю первый объединённый сертификат" create_combined_certificate_cmd "$email" || fatal "Не удалось выпустить первый сертификат."
   RELEVANT=("$TARGET1")
   FALLBACK_ISSUED["$TARGET1"]=1
+  PRODUCTION_RENEWED["$TARGET1"]=1
   summary_ok "Первый объединённый сертификат выпущен"
 }
 
@@ -869,6 +1033,7 @@ renew_due_lineages() {
     case "$status" in
       EXPIRED|EXPIRING)
         if run_task "$name · production renewal" certbot renew --non-interactive --cert-name "$name" --force-renewal; then
+          PRODUCTION_RENEWED["$name"]=1
           summary_ok "$name: свежий production-сертификат"
         else
           fatal "Production renewal завершился ошибкой для $name."
@@ -882,17 +1047,132 @@ renew_due_lineages() {
   done
 }
 
+systemd_unit_exists() {
+  local unit=$1
+  systemctl cat --no-pager "$unit" >/dev/null 2>&1
+}
+
 enable_renew_timer() {
-  if systemctl list-unit-files 2>/dev/null | grep -qE '^certbot\.timer'; then
-    run_task "Включаю certbot.timer" systemctl enable --now certbot.timer || fatal "Не удалось включить certbot.timer."
-    summary_ok "certbot.timer включён"
-  elif systemctl list-unit-files 2>/dev/null | grep -qE '^snap\.certbot\.renew\.timer'; then
-    run_task "Включаю таймер Certbot snap" systemctl enable --now snap.certbot.renew.timer || fatal "Не удалось включить таймер Certbot snap."
-    summary_ok "Таймер Certbot snap включён"
-  else
-    warn "Не найден известный systemd-таймер Certbot."
-    summary_warn "Таймер автопродления Certbot не найден"
+  local unit=''
+
+  if systemd_unit_exists certbot.timer; then
+    unit='certbot.timer'
+  elif systemd_unit_exists snap.certbot.renew.timer; then
+    unit='snap.certbot.renew.timer'
   fi
+
+  if [[ -z $unit ]]; then
+    if [[ -f /etc/cron.d/certbot ]]; then
+      ok "Systemd-таймер Certbot не найден, но обнаружен /etc/cron.d/certbot — автопродление уже настроено через cron"
+      summary_ok "Автопродление Certbot: cron"
+      return 0
+    fi
+    warn "Не найден ни systemd-таймер Certbot, ни /etc/cron.d/certbot."
+    summary_warn "Механизм автопродления Certbot не найден"
+    return 0
+  fi
+
+  if systemctl is-enabled --quiet "$unit" 2>/dev/null && systemctl is-active --quiet "$unit" 2>/dev/null; then
+    ok "$unit уже включён и активен"
+    summary_ok "$unit активен"
+    return 0
+  fi
+
+  run_task "Включаю $unit" systemctl enable --now "$unit" || fatal "Не удалось включить $unit."
+  ok "$unit включён и активен"
+  summary_ok "$unit включён"
+}
+
+test_deploy_hook_once() {
+  [[ -x $HOOK_PATH ]] || { warn "Deploy-hook отсутствует или не исполняемый: $HOOK_PATH"; return 1; }
+  local name d domains=''
+  for name in "${RELEVANT[@]}"; do
+    while IFS= read -r d; do
+      [[ -n $d ]] || continue
+      case " $domains " in *" $d "*) ;; *) domains+="${domains:+ }$d" ;; esac
+    done < <(cert_domains "$name")
+  done
+  [[ -n $domains ]] || domains="$TARGET1"
+
+  if run_task "Проверка deploy-hook nginx" env \
+      RENEWED_DOMAINS="$domains" \
+      RENEWED_LINEAGE="/etc/letsencrypt/live/${RELEVANT[0]:-$TARGET1}" \
+      "$HOOK_PATH"; then
+    summary_ok "Deploy-hook nginx выполнен успешно"
+    return 0
+  fi
+  fatal "Deploy-hook nginx не прошёл ручную проверку."
+}
+
+is_transient_acme_error() {
+  # These responses describe an ACME order/authorization state race rather
+  # than a DNS authentication failure.  In particular, orderNotReady can be
+  # returned while the CA has not yet transitioned an order from pending to
+  # ready.  A fresh Certbot invocation creates a new order and is safe to retry.
+  grep -qiE \
+    'authorization must be pending|Unable to update challenge|orderNotReady|Order.t? status .*pending.*not acceptable for finalization|badNonce|serverInternal' \
+    <<<"${1:-}"
+}
+
+run_task_retryable() {
+  # Variant of run_task used for expected transient staging failures.  It keeps
+  # the full command output in the protected log but avoids a scary red FAIL
+  # until we know the error is actually persistent/non-transient.
+  local label=$1; shift
+  local tmp rc
+  tmp=$(mktemp)
+  CURRENT_TASK=$label
+  log_command "$@"
+
+  "$@" >"$tmp" 2>&1 &
+  ACTIVE_PID=$!
+  if spinner_wait "$ACTIVE_PID" "$label"; then rc=0; else rc=$?; fi
+  ACTIVE_PID=""
+
+  cat "$tmp" >>"$LOG_FILE"
+  LAST_TASK_OUTPUT=$(tail -n 80 "$tmp" 2>/dev/null || true)
+  rm -f "$tmp"
+  CURRENT_TASK=""
+
+  if ((rc == 0)); then
+    ok "$label"
+    return 0
+  fi
+  return "$rc"
+}
+
+dry_run_with_retry() {
+  local name=$1 attempt=1 delay=$DRY_RUN_RETRY_DELAY label rc
+  while ((attempt <= DRY_RUN_MAX_ATTEMPTS)); do
+    label="$name · staging renewal + deploy-hook (попытка $attempt/$DRY_RUN_MAX_ATTEMPTS)"
+    if run_task_retryable "$label" \
+      certbot renew --non-interactive --cert-name "$name" --dry-run --run-deploy-hooks; then
+      return 0
+    else
+      rc=$?
+    fi
+
+    if is_transient_acme_error "$LAST_TASK_OUTPUT"; then
+      if ((attempt < DRY_RUN_MAX_ATTEMPTS)); then
+        warn "$name · staging CA вернул временное состояние ACME (order ещё не готов). Повторю новым order через ${delay}с."
+        sleep "$delay"
+        delay=$((delay * 2))
+        ((attempt+=1))
+        continue
+      fi
+
+      warn "$name · staging CA остаётся во временном состоянии после $DRY_RUN_MAX_ATTEMPTS попыток."
+      note "Production-сертификат и renewal-конфигурация не считаются сломанными из-за orderNotReady/authorization-state race. Повторите аудит позже."
+      return 2
+    fi
+
+    fail "$label"
+    printf '%b%s%b\n' "$DIM" "  Последний вывод:" "$RESET" >&2
+    printf '%s\n' "$LAST_TASK_OUTPUT" | tail -n 18 | sed 's/^/    /' >&2
+    note "Полный лог: $LOG_FILE"
+    return "${rc:-1}"
+  done
+  return 1
 }
 
 dry_run_relevant() {
@@ -900,11 +1180,29 @@ dry_run_relevant() {
 
   local name failures=0
   for name in "${RELEVANT[@]}"; do
-    if run_task "$name · staging renewal + deploy-hook" certbot renew --non-interactive --cert-name "$name" --dry-run --run-deploy-hooks; then
+    if [[ ${PRODUCTION_RENEWED[$name]:-0} == 1 ]]; then
+      ok "$name · сквозная проверка уже подтверждена успешным production renewal; повторный staging сразу после выпуска пропущен"
+      summary_ok "$name: production renewal подтверждает выпуск"
+      continue
+    fi
+
+    if [[ ${STAGING_TESTED[$name]:-0} == 1 ]]; then
+      ok "$name · staging уже успешно пройден во время reconfigure; повторный order не создаётся"
+      summary_ok "$name: staging проверен при reconfigure"
+      continue
+    fi
+
+    local dry_rc=0
+    if dry_run_with_retry "$name"; then
       summary_ok "$name: dry-run"
     else
-      ((failures+=1))
-      summary_fail "$name: dry-run"
+      dry_rc=$?
+      if ((dry_rc == 2)); then
+        summary_warn "$name: staging вернул временное состояние ACME; повторить проверку позже"
+      else
+        ((failures+=1))
+        summary_fail "$name: dry-run"
+      fi
     fi
   done
 
@@ -962,6 +1260,35 @@ maybe_cleanup_legacy() {
   fi
 }
 
+maybe_cleanup_unused_lineages() {
+  local name refs status
+  ((${#UNUSED_LINEAGES[@]})) || return 0
+
+  for name in "${UNUSED_LINEAGES[@]}"; do
+    [[ -f /etc/letsencrypt/renewal/$name.conf ]] || continue
+    refs=$(lineage_reference_probe "$name")
+    if [[ -n $refs ]]; then
+      warn "$name снова обнаружен в активной конфигурации; удаление отменено: $refs"
+      summary_warn "$name сохранён: появились активные ссылки"
+      continue
+    fi
+
+    status=$(cert_status "$name")
+    warn "$name · активные ссылки не найдены · состояние: $status"
+    note "Стандартный certbot.timer продолжит обслуживать этот lineage, пока он существует."
+    if ! confirm "Удалить неиспользуемый Certbot lineage $name?" N; then
+      summary_warn "Неиспользуемый lineage оставлен: $name"
+      continue
+    fi
+
+    if run_task "Удаляю неиспользуемый lineage $name" certbot delete --non-interactive --cert-name "$name"; then
+      summary_ok "Неиспользуемый lineage удалён: $name"
+    else
+      summary_warn "Не удалось удалить неиспользуемый lineage: $name"
+    fi
+  done
+}
+
 redundant_lineage_notes() {
   local a b a_domains b_domains d subset
   ((${#RELEVANT[@]} >= 2)) || return 0
@@ -986,18 +1313,85 @@ redundant_lineage_notes() {
   done
 }
 
-external_tls_check() {
-  local d out
-  have timeout || return 0
-  for d in "$TARGET1" "$TARGET2"; do
-    out=$(timeout 8 openssl s_client -connect "$d:443" -servername "$d" </dev/null 2>/dev/null \
-      | openssl x509 -noout -enddate -subject 2>/dev/null || true)
-    if [[ -n $out ]]; then
-      ok "Внешний TLS отвечает для $d"
-      printf '%s\n' "$out" | sed 's/^/    /'
-    else
-      warn "Не удалось проверить внешний TLS для $d:443 (возможно, сервис намеренно не слушает этот порт)."
+detect_tls_topology() {
+  local c nginx_t line
+  TLS_TOPOLOGY="unknown"
+  TLS_443_OWNER=""
+  NGINX_LISTEN_SUMMARY=""
+
+  if have ss; then
+    line=$(ss -lntp 2>/dev/null | awk '$4 ~ /:443$/ {print; exit}' || true)
+    if [[ -n $line ]]; then
+      TLS_443_OWNER=$(sed -n 's/.*users:(("\([^"]*\)".*/\1/p' <<<"$line" | head -n1)
+      [[ -n $TLS_443_OWNER ]] || TLS_443_OWNER="не определён"
     fi
+  fi
+
+  c=${NGINX_CONTAINER:-${NGINX_CONTAINER_OVERRIDE:-$DEFAULT_NGINX_CONTAINER}}
+  if have docker && docker inspect "$c" >/dev/null 2>&1; then
+    nginx_t=$(docker exec "$c" nginx -T 2>/dev/null || true)
+    if grep -Eq 'listen[[:space:]]+unix:[^;]*ssl[^;]*proxy_protocol' <<<"$nginx_t"; then
+      TLS_TOPOLOGY="core-unix-nginx"
+      NGINX_LISTEN_SUMMARY=$(grep -E 'listen[[:space:]]+unix:[^;]*ssl' <<<"$nginx_t" | head -n1 | sed 's/^[[:space:]]*//')
+    elif grep -Eq 'listen[[:space:]]+([^;[:space:]]*:)?443([^0-9]|;)' <<<"$nginx_t"; then
+      TLS_TOPOLOGY="nginx-direct"
+      NGINX_LISTEN_SUMMARY=$(grep -E 'listen[[:space:]]+([^;[:space:]]*:)?443' <<<"$nginx_t" | head -n1 | sed 's/^[[:space:]]*//')
+    elif [[ $TLS_443_OWNER == nginx ]]; then
+      TLS_TOPOLOGY="nginx-direct"
+    fi
+  fi
+}
+
+show_tls_topology() {
+  detect_tls_topology
+  case "$TLS_TOPOLOGY" in
+    core-unix-nginx)
+      ok "TLS-топология: внешний :443 обслуживает ${TLS_443_OWNER:-другой процесс}, nginx принимает TLS через Unix-сокет"
+      [[ -n $NGINX_LISTEN_SUMMARY ]] && note "$NGINX_LISTEN_SUMMARY"
+      note "Внешний openssl :443 не используется как проверка сертификата nginx в этой схеме."
+      ;;
+    nginx-direct)
+      ok "TLS-топология: nginx обслуживает TCP/443 напрямую${TLS_443_OWNER:+ · процесс: $TLS_443_OWNER}"
+      [[ -n $NGINX_LISTEN_SUMMARY ]] && note "$NGINX_LISTEN_SUMMARY"
+      ;;
+    *)
+      warn "TLS-топология не определена однозначно${TLS_443_OWNER:+ · TCP/443: $TLS_443_OWNER}."
+      ;;
+  esac
+}
+
+external_tls_check() {
+  local name d out cert
+  have openssl || return 0
+  detect_tls_topology
+
+  if [[ $TLS_TOPOLOGY == core-unix-nginx ]]; then
+    info "Прямая проверка :443 пропущена: порт принадлежит ${TLS_443_OWNER:-frontend-процессу}, а nginx работает через Unix-сокет."
+    for name in "${RELEVANT[@]}"; do
+      cert="/etc/letsencrypt/live/$name/fullchain.pem"
+      [[ -r $cert ]] || continue
+      out=$(openssl x509 -in "$cert" -noout -subject -enddate 2>/dev/null || true)
+      if [[ -n $out ]]; then
+        ok "Локальный сертификат $name читается корректно"
+        printf '%s\n' "$out" | sed 's/^/    /'
+      fi
+    done
+    return 0
+  fi
+
+  have timeout || return 0
+  for name in "${RELEVANT[@]}"; do
+    while IFS= read -r d; do
+      [[ -n $d ]] || continue
+      out=$(timeout 8 openssl s_client -connect "$d:443" -servername "$d" </dev/null 2>/dev/null \
+        | openssl x509 -noout -enddate -subject 2>/dev/null || true)
+      if [[ -n $out ]]; then
+        ok "Внешний TLS отвечает для $d"
+        printf '%s\n' "$out" | sed 's/^/    /'
+      else
+        warn "Не удалось получить TLS-сертификат от $d:443."
+      fi
+    done < <(cert_domains "$name")
   done
 }
 
@@ -1009,8 +1403,10 @@ print_timer_state() {
     [[ -n $next ]] && note "$next"
   elif systemctl is-active --quiet snap.certbot.renew.timer 2>/dev/null; then
     ok "snap.certbot.renew.timer активен"
+  elif [[ -f /etc/cron.d/certbot ]]; then
+    ok "Автопродление Certbot настроено через /etc/cron.d/certbot"
   else
-    warn "Таймер автопродления Certbot не активен."
+    warn "Механизм автопродления Certbot не найден или не активен."
   fi
 }
 
@@ -1066,6 +1462,7 @@ audit_runtime() {
     warn "Docker не установлен или недоступен"
   fi
 
+  show_tls_topology
   print_timer_state
 }
 
@@ -1093,6 +1490,7 @@ final_report() {
     summary_fail "Проверка nginx"
   fi
 
+  show_tls_topology
   print_timer_state
   external_tls_check
 
@@ -1158,8 +1556,8 @@ main() {
   fi
 
   printf '\n'
-  info "Далее будут настроены Cloudflare DNS-01, deploy-hook nginx и автоматическое продление."
-  note "Legacy $LEGACY_NAME исключён из миграции; удаление возможно только после проверки ссылок."
+  info "Далее будут настроены Cloudflare DNS-01, deploy-hook nginx и автоматическое продление только для обслуживаемых lineage."
+  note "Lineage без активных ссылок не мигрируются автоматически; legacy $LEGACY_NAME также исключён."
   confirm "Продолжить и применить изменения?" Y || exit 0
 
   section "5 · Cloudflare"
@@ -1184,11 +1582,13 @@ main() {
   section "9 · Автоматическое продление"
   enable_renew_timer
 
-  section "10 · Сквозная staging-проверка"
+  section "10 · Сквозная проверка"
+  test_deploy_hook_once
   dry_run_relevant
 
-  section "11 · Проверка старых сертификатов"
+  section "11 · Проверка старых и неиспользуемых сертификатов"
   maybe_cleanup_legacy
+  maybe_cleanup_unused_lineages
   redundant_lineage_notes
 
   final_report
