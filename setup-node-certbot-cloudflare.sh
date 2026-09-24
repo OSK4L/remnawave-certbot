@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # Universal Certbot + Cloudflare DNS-01 setup for Remnawave nodes.
 # Ubuntu / Debian oriented, Docker Compose aware.
 
-SCRIPT_VERSION="2.2.2"
+SCRIPT_VERSION="2.2.3"
 PROG=${0##*/}
 
 # ---- Defaults ----------------------------------------------------------------
@@ -61,6 +61,8 @@ declare -A LINEAGE_USAGE_REASON=()
 LAST_TASK_OUTPUT=""
 TLS_TOPOLOGY="unknown"
 TLS_443_OWNER=""
+TLS_443_PID=""
+NGINX_CONTAINER_PID=""
 NGINX_LISTEN_SUMMARY=""
 
 # ---- UI ----------------------------------------------------------------------
@@ -505,54 +507,64 @@ add_relevant_once() {
 }
 
 lineage_reference_probe() {
-  local name=$1 c pid
+  local name=$1 c pid base compose_render mounts nginx_t proc_text
   local -a reasons=()
 
-  # Current Remnawave configuration files. Avoid backups and Certbot's own files.
+  # Only active configuration counts as a reference. Historical logs, backups,
+  # shell history and Certbot's own files must never keep an obsolete lineage alive.
+  base=${COMPOSE_DIR:-$DEFAULT_COMPOSE_DIR}
   for c in \
-    "$DEFAULT_COMPOSE_DIR/docker-compose.yml" \
-    "$DEFAULT_COMPOSE_DIR/compose.yml" \
-    "$DEFAULT_COMPOSE_DIR/compose.yaml" \
-    "$DEFAULT_COMPOSE_DIR/nginx.conf"; do
+    "$base/docker-compose.yml" \
+    "$base/compose.yml" \
+    "$base/compose.yaml" \
+    "$base/nginx.conf"; do
     [[ -f $c ]] || continue
     if grep -Fq "$name" "$c" 2>/dev/null; then
-      reasons+=("${c}")
+      reasons+=("$c")
     fi
   done
 
-  # Active Compose rendering, checked silently so secrets are never printed to terminal/log.
-  if [[ -d $DEFAULT_COMPOSE_DIR ]] && have docker; then
-    if (cd "$DEFAULT_COMPOSE_DIR" && docker compose config 2>/dev/null | grep -Fq "$name"); then
+  # Capture producer output first. This avoids false negatives from grep -q +
+  # pipefail/SIGPIPE on large docker/nginx output.
+  if [[ -d $base ]] && have docker; then
+    compose_render=$(cd "$base" && docker compose config 2>/dev/null || true)
+    if [[ -n $compose_render ]] && grep -Fq "$name" <<<"$compose_render"; then
       reasons+=("docker-compose(active)")
     fi
   fi
 
-  # Docker mounts are one of the strongest signals that a lineage is actually in use.
+  # Docker mounts are one of the strongest signals that a lineage is in use.
   if have docker; then
     while IFS= read -r c; do
       [[ -n $c ]] || continue
-      if docker inspect "$c" --format '{{range .Mounts}}{{printf "%s -> %s\n" .Source .Destination}}{{end}}' 2>/dev/null | grep -Fq "$name"; then
+      mounts=$(docker inspect "$c" --format '{{range .Mounts}}{{printf "%s -> %s\n" .Source .Destination}}{{end}}' 2>/dev/null || true)
+      if [[ -n $mounts ]] && grep -Fq "$name" <<<"$mounts"; then
         reasons+=("mount:$c")
       fi
     done < <(docker ps -a --format '{{.Names}}' 2>/dev/null || true)
 
-    c=${NGINX_CONTAINER_OVERRIDE:-$DEFAULT_NGINX_CONTAINER}
+    c=${NGINX_CONTAINER:-${NGINX_CONTAINER_OVERRIDE:-$DEFAULT_NGINX_CONTAINER}}
     if docker inspect "$c" >/dev/null 2>&1; then
-      if docker exec "$c" nginx -T 2>/dev/null | grep -Fq "$name"; then
+      nginx_t=$(docker exec "$c" nginx -T 2>/dev/null || true)
+      if [[ -n $nginx_t ]] && grep -Fq "$name" <<<"$nginx_t"; then
         reasons+=("nginx:$c")
       fi
     fi
   fi
 
-  # Some Remnawave topologies have rw-core in front of nginx. Only record a boolean
-  # match; never print the process environment because it may contain secrets.
+  # Some Remnawave topologies have rw-core in front of nginx. Only record a
+  # boolean match; never print process environment because it may contain secrets.
   while IFS= read -r pid; do
     [[ -r /proc/$pid/cmdline ]] || continue
-    if tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -Fq "$name"; then
+    proc_text=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+    if [[ -n $proc_text ]] && grep -Fq "$name" <<<"$proc_text"; then
       reasons+=("rw-core:cmdline")
     fi
-    if [[ -r /proc/$pid/environ ]] && tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -Fq "$name"; then
-      reasons+=("rw-core:env")
+    if [[ -r /proc/$pid/environ ]]; then
+      proc_text=$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null || true)
+      if [[ -n $proc_text ]] && grep -Fq "$name" <<<"$proc_text"; then
+        reasons+=("rw-core:env")
+      fi
     fi
   done < <(pgrep -x rw-core 2>/dev/null || true)
 
@@ -1211,21 +1223,14 @@ dry_run_relevant() {
 
 # ---- Cleanup / reporting ------------------------------------------------------
 legacy_reference_report() {
-  local legacy=$1 refs='' c m
+  local legacy=$1 refs
 
-  for c in "$COMPOSE_DIR" /etc/nginx; do
-    [[ -d $c ]] || continue
-    m=$(grep -R -n -F "$legacy" "$c" 2>/dev/null || true)
-    [[ -n $m ]] && refs+="$m"$'\n'
-  done
-
-  while IFS= read -r c; do
-    [[ -n $c ]] || continue
-    m=$(docker inspect "$c" --format '{{range .Mounts}}{{printf "%s -> %s\n" .Source .Destination}}{{end}}' 2>/dev/null | grep -F "$legacy" || true)
-    [[ -n $m ]] && refs+="container=$c: $m"$'\n'
-  done < <(docker ps -a --format '{{.Names}}')
-
-  printf '%s' "$refs"
+  # Reuse the same active-reference detector used by the main audit.
+  # Do NOT recursively grep the whole Remnawave directory: access/error logs
+  # contain historical Host/Referer values and are not active configuration.
+  refs=$(lineage_reference_probe "$legacy")
+  [[ -n $refs ]] || return 0
+  tr ',' '\n' <<<"$refs"
 }
 
 maybe_cleanup_legacy() {
@@ -1290,22 +1295,38 @@ maybe_cleanup_unused_lineages() {
 }
 
 redundant_lineage_notes() {
-  local a b a_domains b_domains d subset
+  local a b d subset
+  local -a a_domains=() b_domains=()
+  local -A b_set=()
+
   ((${#RELEVANT[@]} >= 2)) || return 0
 
   for a in "${RELEVANT[@]}"; do
-    a_domains=$(cert_domains "$a" | sort -u)
-    [[ -n $a_domains ]] || continue
+    mapfile -t a_domains < <(cert_domains "$a" | awk 'NF' | sort -u)
+    ((${#a_domains[@]})) || continue
+
     for b in "${RELEVANT[@]}"; do
       [[ $a == "$b" ]] && continue
-      b_domains=$(cert_domains "$b" | sort -u)
-      [[ -n $b_domains ]] || continue
+      mapfile -t b_domains < <(cert_domains "$b" | awk 'NF' | sort -u)
+      ((${#b_domains[@]})) || continue
+
+      b_set=()
+      for d in "${b_domains[@]}"; do
+        b_set["$d"]=1
+      done
+
       subset=1
-      while IFS= read -r d; do
-        grep -Fxq "$d" <<<"$b_domains" || { subset=0; break; }
-      done <<<"$a_domains"
+      for d in "${a_domains[@]}"; do
+        if [[ -z ${b_set["$d"]+x} ]]; then
+          subset=0
+          break
+        fi
+      done
+
       if ((subset)); then
         warn "$a полностью покрывается SAN сертификата $b. Возможно, это дубликат; автоматически он не удаляется."
+        note "$a: $(IFS=,; echo "${a_domains[*]}")"
+        note "$b: $(IFS=,; echo "${b_domains[*]}")"
         summary_warn "Возможный дубликат lineage: $a (покрывается $b)"
         return 0
       fi
@@ -1314,30 +1335,44 @@ redundant_lineage_notes() {
 }
 
 detect_tls_topology() {
-  local c nginx_t line
+  local c nginx_t line direct_listen unix_listen
   TLS_TOPOLOGY="unknown"
   TLS_443_OWNER=""
+  TLS_443_PID=""
+  NGINX_CONTAINER_PID=""
   NGINX_LISTEN_SUMMARY=""
 
   if have ss; then
     line=$(ss -lntp 2>/dev/null | awk '$4 ~ /:443$/ {print; exit}' || true)
     if [[ -n $line ]]; then
       TLS_443_OWNER=$(sed -n 's/.*users:(("\([^"]*\)".*/\1/p' <<<"$line" | head -n1)
+      TLS_443_PID=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$line" | head -n1)
       [[ -n $TLS_443_OWNER ]] || TLS_443_OWNER="не определён"
     fi
   fi
 
   c=${NGINX_CONTAINER:-${NGINX_CONTAINER_OVERRIDE:-$DEFAULT_NGINX_CONTAINER}}
   if have docker && docker inspect "$c" >/dev/null 2>&1; then
+    NGINX_CONTAINER_PID=$(docker inspect -f '{{.State.Pid}}' "$c" 2>/dev/null || true)
     nginx_t=$(docker exec "$c" nginx -T 2>/dev/null || true)
-    if grep -Eq 'listen[[:space:]]+unix:[^;]*ssl[^;]*proxy_protocol' <<<"$nginx_t"; then
-      TLS_TOPOLOGY="core-unix-nginx"
-      NGINX_LISTEN_SUMMARY=$(grep -E 'listen[[:space:]]+unix:[^;]*ssl' <<<"$nginx_t" | head -n1 | sed 's/^[[:space:]]*//')
-    elif grep -Eq 'listen[[:space:]]+([^;[:space:]]*:)?443([^0-9]|;)' <<<"$nginx_t"; then
+
+    direct_listen=$(grep -E 'listen[[:space:]]+([^;[:space:]]*:)?443([^0-9]|;)' <<<"$nginx_t" | head -n1 | sed 's/^[[:space:]]*//' || true)
+    unix_listen=$(grep -E 'listen[[:space:]]+unix:[^;]*ssl' <<<"$nginx_t" | head -n1 | sed 's/^[[:space:]]*//' || true)
+
+    if [[ -n $direct_listen ]]; then
       TLS_TOPOLOGY="nginx-direct"
-      NGINX_LISTEN_SUMMARY=$(grep -E 'listen[[:space:]]+([^;[:space:]]*:)?443' <<<"$nginx_t" | head -n1 | sed 's/^[[:space:]]*//')
-    elif [[ $TLS_443_OWNER == nginx ]]; then
-      TLS_TOPOLOGY="nginx-direct"
+      NGINX_LISTEN_SUMMARY=$direct_listen
+    elif [[ -n $unix_listen ]]; then
+      NGINX_LISTEN_SUMMARY=$unix_listen
+      if [[ -n $TLS_443_PID ]]; then
+        if [[ -n $NGINX_CONTAINER_PID && $TLS_443_PID != "$NGINX_CONTAINER_PID" ]]; then
+          TLS_TOPOLOGY="frontend-unix-nginx"
+        else
+          TLS_TOPOLOGY="unix-nginx-ambiguous"
+        fi
+      else
+        TLS_TOPOLOGY="unix-nginx-no443"
+      fi
     fi
   fi
 }
@@ -1345,17 +1380,28 @@ detect_tls_topology() {
 show_tls_topology() {
   detect_tls_topology
   case "$TLS_TOPOLOGY" in
-    core-unix-nginx)
-      ok "TLS-топология: внешний :443 обслуживает ${TLS_443_OWNER:-другой процесс}, nginx принимает TLS через Unix-сокет"
-      [[ -n $NGINX_LISTEN_SUMMARY ]] && note "$NGINX_LISTEN_SUMMARY"
-      note "Внешний openssl :443 не используется как проверка сертификата nginx в этой схеме."
+    frontend-unix-nginx)
+      ok "TLS-топология: TCP/443 обслуживает отдельный frontend, контейнер nginx принимает TLS через Unix-сокет"
+      note "TCP/443: ${TLS_443_OWNER:-не определён}${TLS_443_PID:+ · PID $TLS_443_PID}"
+      [[ -n $NGINX_LISTEN_SUMMARY ]] && note "nginx: $NGINX_LISTEN_SUMMARY"
+      note "Внешний openssl :443 не используется как прямая проверка сертификата контейнера nginx."
+      ;;
+    unix-nginx-no443)
+      ok "TLS-топология: контейнер nginx принимает TLS через Unix-сокет; TCP/443 на хосте не обнаружен"
+      [[ -n $NGINX_LISTEN_SUMMARY ]] && note "nginx: $NGINX_LISTEN_SUMMARY"
+      ;;
+    unix-nginx-ambiguous)
+      warn "TLS-топология: nginx принимает TLS через Unix-сокет, но владельца TCP/443 нельзя надёжно отделить от контейнера."
+      note "TCP/443: ${TLS_443_OWNER:-не определён}${TLS_443_PID:+ · PID $TLS_443_PID}"
+      [[ -n $NGINX_LISTEN_SUMMARY ]] && note "nginx: $NGINX_LISTEN_SUMMARY"
       ;;
     nginx-direct)
-      ok "TLS-топология: nginx обслуживает TCP/443 напрямую${TLS_443_OWNER:+ · процесс: $TLS_443_OWNER}"
-      [[ -n $NGINX_LISTEN_SUMMARY ]] && note "$NGINX_LISTEN_SUMMARY"
+      ok "TLS-топология: конфигурация контейнера nginx содержит прямой TCP/443 listener"
+      [[ -n $NGINX_LISTEN_SUMMARY ]] && note "nginx: $NGINX_LISTEN_SUMMARY"
+      [[ -n $TLS_443_OWNER ]] && note "TCP/443: $TLS_443_OWNER${TLS_443_PID:+ · PID $TLS_443_PID}"
       ;;
     *)
-      warn "TLS-топология не определена однозначно${TLS_443_OWNER:+ · TCP/443: $TLS_443_OWNER}."
+      warn "TLS-топология не определена однозначно${TLS_443_OWNER:+ · TCP/443: $TLS_443_OWNER}${TLS_443_PID:+ · PID $TLS_443_PID}."
       ;;
   esac
 }
@@ -1365,19 +1411,21 @@ external_tls_check() {
   have openssl || return 0
   detect_tls_topology
 
-  if [[ $TLS_TOPOLOGY == core-unix-nginx ]]; then
-    info "Прямая проверка :443 пропущена: порт принадлежит ${TLS_443_OWNER:-frontend-процессу}, а nginx работает через Unix-сокет."
-    for name in "${RELEVANT[@]}"; do
-      cert="/etc/letsencrypt/live/$name/fullchain.pem"
-      [[ -r $cert ]] || continue
-      out=$(openssl x509 -in "$cert" -noout -subject -enddate 2>/dev/null || true)
-      if [[ -n $out ]]; then
-        ok "Локальный сертификат $name читается корректно"
-        printf '%s\n' "$out" | sed 's/^/    /'
-      fi
-    done
-    return 0
-  fi
+  case "$TLS_TOPOLOGY" in
+    frontend-unix-nginx|unix-nginx-no443|unix-nginx-ambiguous)
+      info "Прямая проверка :443 пропущена: сертификат контейнера nginx проверяется локально, так как его TLS listener — Unix-сокет."
+      for name in "${RELEVANT[@]}"; do
+        cert="/etc/letsencrypt/live/$name/fullchain.pem"
+        [[ -r $cert ]] || continue
+        out=$(openssl x509 -in "$cert" -noout -subject -enddate 2>/dev/null || true)
+        if [[ -n $out ]]; then
+          ok "Локальный сертификат $name читается корректно"
+          printf '%s\n' "$out" | sed 's/^/    /'
+        fi
+      done
+      return 0
+      ;;
+  esac
 
   have timeout || return 0
   for name in "${RELEVANT[@]}"; do
