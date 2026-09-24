@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # Universal Certbot + Cloudflare DNS-01 setup for Remnawave nodes.
 # Ubuntu / Debian oriented, Docker Compose aware.
 
-SCRIPT_VERSION="2.2.3"
+SCRIPT_VERSION="2.2.4"
 PROG=${0##*/}
 
 # ---- Defaults ----------------------------------------------------------------
@@ -64,6 +64,7 @@ TLS_443_OWNER=""
 TLS_443_PID=""
 NGINX_CONTAINER_PID=""
 NGINX_LISTEN_SUMMARY=""
+SHADOW_SYNC_SPECS=()
 
 # ---- UI ----------------------------------------------------------------------
 if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
@@ -447,7 +448,8 @@ detect_identity() {
 }
 
 cert_domains() {
-  local name=$1 cert="/etc/letsencrypt/live/$name/cert.pem"
+  local name=$1
+  local cert="/etc/letsencrypt/live/$name/cert.pem"
   [[ -r $cert ]] || return 0
   openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null \
     | grep -oE 'DNS:[^,[:space:]]+' \
@@ -455,7 +457,9 @@ cert_domains() {
 }
 
 cert_end_epoch() {
-  local name=$1 cert="/etc/letsencrypt/live/$name/cert.pem" raw
+  local name=$1
+  local cert="/etc/letsencrypt/live/$name/cert.pem"
+  local raw
   [[ -r $cert ]] || return 1
   raw=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | cut -d= -f2-)
   [[ -n $raw ]] || return 1
@@ -477,14 +481,18 @@ cert_status() {
 }
 
 cert_expiry_date() {
-  local name=$1 cert="/etc/letsencrypt/live/$name/cert.pem" raw
+  local name=$1
+  local cert="/etc/letsencrypt/live/$name/cert.pem"
+  local raw
   [[ -r $cert ]] || { printf '-'; return; }
   raw=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | cut -d= -f2-)
   date -d "$raw" '+%Y-%m-%d' 2>/dev/null || printf '-'
 }
 
 renewal_value() {
-  local name=$1 key=$2 conf="/etc/letsencrypt/renewal/$name.conf"
+  local name=$1
+  local key=$2
+  local conf="/etc/letsencrypt/renewal/$name.conf"
   [[ -r $conf ]] || return 0
   awk -F' = ' -v k="$key" '$1 == k {print $2; exit}' "$conf"
 }
@@ -777,7 +785,9 @@ detect_docker_context() {
   [[ -n $NGINX_CONTAINER_OVERRIDE ]] || prompt_default NGINX_CONTAINER "nginx-контейнер" "$NGINX_CONTAINER"
   docker inspect "$NGINX_CONTAINER" >/dev/null 2>&1 || fatal "Контейнер $NGINX_CONTAINER не найден."
 
-  local wd service mounts has_full=0 has_individual=0
+  local wd service mounts has_full=0 has_individual=0 has_shadow=0
+  local src dst name
+  SHADOW_SYNC_SPECS=()
   wd=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$NGINX_CONTAINER" 2>/dev/null || true)
   service=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$NGINX_CONTAINER" 2>/dev/null || true)
   [[ -n $wd && $wd != '<no value>' ]] || wd=$DEFAULT_COMPOSE_DIR
@@ -801,6 +811,18 @@ detect_docker_context() {
     if [[ $src == /etc/letsencrypt/live/* || $src == /etc/letsencrypt/archive/* || $dst == */fullchain.pem || $dst == */privkey.pem ]]; then
       has_individual=1
     fi
+
+    # Some old nodes mount a copied certificate directory from /opt/remnanode/ssl
+    # instead of mounting /etc/letsencrypt.  Recreating nginx alone does NOT update
+    # such a copy, so remember it and mirror the fresh Certbot files in the hook.
+    if [[ $src != /etc/letsencrypt* && $dst == /etc/nginx/ssl/* ]]; then
+      for name in "${RELEVANT[@]:-}"; do
+        if [[ $dst == *"/$name" || $src == *"/$name" ]]; then
+          SHADOW_SYNC_SPECS+=("$name|$src")
+          has_shadow=1
+        fi
+      done
+    fi
   done <<<"$mounts"
 
   # Individual file mounts take precedence. Certbot's live files are symlinks,
@@ -811,6 +833,11 @@ detect_docker_context() {
   elif ((has_full)); then
     HOOK_MODE="reload"
     ok "Docker: /etc/letsencrypt смонтирован целиком → после продления nginx будет перезагружен"
+  elif ((has_shadow)); then
+    HOOK_MODE="mirror-recreate"
+    warn "Обнаружен legacy bind mount с копией сертификата вне /etc/letsencrypt."
+    for name in "${SHADOW_SYNC_SPECS[@]}"; do note "mirror: $name"; done
+    ok "После продления свежий сертификат будет атомарно скопирован в bind mount и nginx будет пересоздан"
   else
     warn "Не удалось определить bind mount сертификатов Certbot для nginx."
     printf '%s\n' "$mounts" | sed 's/^/    /'
@@ -883,22 +910,68 @@ run_quiet() {
   fi
 }
 
-cd "\$COMPOSE_DIR"
-run_quiet "\$DOCKER" compose up -d --force-recreate --no-deps "\$SERVICE"
+sync_cert_copy() {
+  lineage="\$1"
+  dest="\$2"
+  live="/etc/letsencrypt/live/\$lineage"
+
+  [ -r "\$live/fullchain.pem" ] || {
+    printf '%s\n' "Не найден \$live/fullchain.pem" >&2
+    return 1
+  }
+  [ -r "\$live/privkey.pem" ] || {
+    printf '%s\n' "Не найден \$live/privkey.pem" >&2
+    return 1
+  }
+
+  mkdir -p "\$dest"
+  tmp_cert="\$dest/.fullchain.pem.\$\$"
+  tmp_key="\$dest/.privkey.pem.\$\$"
+  trap 'rm -f "\$tmp_cert" "\$tmp_key"' EXIT HUP INT TERM
+
+  cp -L "\$live/fullchain.pem" "\$tmp_cert"
+  cp -L "\$live/privkey.pem" "\$tmp_key"
+  chmod 0644 "\$tmp_cert"
+  chmod 0600 "\$tmp_key"
+  mv -f "\$tmp_cert" "\$dest/fullchain.pem"
+  mv -f "\$tmp_key" "\$dest/privkey.pem"
+  trap - EXIT HUP INT TERM
+}
+EOF
+
+    if [[ $HOOK_MODE == mirror-recreate ]]; then
+      local spec lineage dest q_lineage q_dest
+      for spec in "${SHADOW_SYNC_SPECS[@]}"; do
+        lineage=${spec%%|*}
+        dest=${spec#*|}
+        printf -v q_lineage '%q' "$lineage"
+        printf -v q_dest '%q' "$dest"
+        cat >>"$HOOK_PATH" <<EOF
+case " \${RENEWED_DOMAINS:-} " in
+  *" $lineage "*) sync_cert_copy $q_lineage $q_dest ;;
+esac
+EOF
+      done
+    fi
+
+    cat >>"$HOOK_PATH" <<'EOF'
+
+cd "$COMPOSE_DIR"
+run_quiet "$DOCKER" compose up -d --force-recreate --no-deps "$SERVICE"
 
 i=0
-while [ "\$i" -lt 30 ]; do
-  if "\$DOCKER" inspect -f '{{.State.Running}}' "\$CONTAINER" 2>/dev/null | grep -q '^true$'; then
-    if "\$DOCKER" exec "\$CONTAINER" nginx -t >/dev/null 2>&1; then
+while [ "$i" -lt 30 ]; do
+  if "$DOCKER" inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q '^true$'; then
+    if "$DOCKER" exec "$CONTAINER" nginx -t >/dev/null 2>&1; then
       exit 0
     fi
   fi
-  i=\$((i + 1))
+  i=$((i + 1))
   sleep 1
 done
 
 printf '%s\n' "nginx не стал готов после пересоздания через Docker Compose" >&2
-"\$DOCKER" logs --tail 50 "\$CONTAINER" >&2 || true
+"$DOCKER" logs --tail 50 "$CONTAINER" >&2 || true
 exit 1
 EOF
   fi
@@ -1341,6 +1414,7 @@ detect_tls_topology() {
   TLS_443_PID=""
   NGINX_CONTAINER_PID=""
   NGINX_LISTEN_SUMMARY=""
+SHADOW_SYNC_SPECS=()
 
   if have ss; then
     line=$(ss -lntp 2>/dev/null | awk '$4 ~ /:443$/ {print; exit}' || true)
@@ -1407,7 +1481,8 @@ show_tls_topology() {
 }
 
 external_tls_check() {
-  local name d out cert
+  local name d out cert tmp remote_fp local_fp subject enddate
+  local host_ok time_ok
   have openssl || return 0
   detect_tls_topology
 
@@ -1428,17 +1503,65 @@ external_tls_check() {
   esac
 
   have timeout || return 0
+
   for name in "${RELEVANT[@]}"; do
+    cert="/etc/letsencrypt/live/$name/fullchain.pem"
+    local_fp=''
+    if [[ -r $cert ]]; then
+      local_fp=$(openssl x509 -in "$cert" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2- || true)
+    fi
+
     while IFS= read -r d; do
       [[ -n $d ]] || continue
-      out=$(timeout 8 openssl s_client -connect "$d:443" -servername "$d" </dev/null 2>/dev/null \
-        | openssl x509 -noout -enddate -subject 2>/dev/null || true)
-      if [[ -n $out ]]; then
-        ok "Внешний TLS отвечает для $d"
-        printf '%s\n' "$out" | sed 's/^/    /'
-      else
-        warn "Не удалось получить TLS-сертификат от $d:443."
+      tmp=$(mktemp)
+
+      if ! timeout 8 openssl s_client -connect "$d:443" -servername "$d" -showcerts </dev/null 2>/dev/null \
+          | awk '/-----BEGIN CERTIFICATE-----/{p=1} p{print} /-----END CERTIFICATE-----/{exit}' >"$tmp" \
+          || [[ ! -s $tmp ]]; then
+        rm -f "$tmp"
+        fail "Не удалось получить TLS-сертификат от $d:443."
+        summary_fail "$d: внешний TLS недоступен"
+        continue
       fi
+
+      subject=$(openssl x509 -in "$tmp" -noout -subject 2>/dev/null || true)
+      enddate=$(openssl x509 -in "$tmp" -noout -enddate 2>/dev/null || true)
+      remote_fp=$(openssl x509 -in "$tmp" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2- || true)
+
+      host_ok=0
+      time_ok=0
+      openssl x509 -in "$tmp" -noout -checkhost "$d" >/dev/null 2>&1 && host_ok=1
+      openssl x509 -in "$tmp" -noout -checkend 0 >/dev/null 2>&1 && time_ok=1
+
+      if ((host_ok == 0)); then
+        fail "$d:443 отдаёт сертификат, который НЕ подходит для hostname $d"
+        [[ -n $subject ]] && note "$subject"
+        [[ -n $enddate ]] && note "$enddate"
+        summary_fail "$d: внешний сертификат не содержит нужный hostname"
+        rm -f "$tmp"
+        continue
+      fi
+
+      if ((time_ok == 0)); then
+        fail "$d:443 отдаёт ПРОСРОЧЕННЫЙ сертификат"
+        [[ -n $subject ]] && note "$subject"
+        [[ -n $enddate ]] && note "$enddate"
+        summary_fail "$d: внешний сертификат просрочен"
+        rm -f "$tmp"
+        continue
+      fi
+
+      ok "Внешний TLS корректен для $d"
+      [[ -n $enddate ]] && note "$enddate"
+      [[ -n $subject ]] && note "$subject"
+
+      if [[ -n $local_fp && -n $remote_fp && $local_fp != "$remote_fp" ]]; then
+        warn "$d: внешний сертификат валиден, но отличается от текущего Certbot lineage $name."
+        note "Это допустимо только если nginx намеренно использует другой валидный SAN-сертификат."
+        summary_warn "$d: внешний сертификат отличается от lineage $name"
+      fi
+
+      rm -f "$tmp"
     done < <(cert_domains "$name")
   done
 }
